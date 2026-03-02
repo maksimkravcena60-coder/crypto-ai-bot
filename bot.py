@@ -2,7 +2,7 @@ import os
 import json
 import time
 import requests
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -11,6 +11,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from apscheduler.schedulers.background import BackgroundScheduler
 from openai import OpenAI
 
+import feedparser
+
 
 # =========================
 # ENV
@@ -18,7 +20,6 @@ from openai import OpenAI
 load_dotenv()
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
-CRYPTOPANIC_API_KEY = (os.getenv("CRYPTOPANIC_API_KEY") or "").strip()
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN пустой. Добавь токен в .env")
@@ -29,47 +30,29 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # =========================
-# Storage: chat_ids + watchlist (простая)
+# Storage: chat ids
 # =========================
 DATA_DIR = "data"
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
-
-DEFAULT_STATE = {
-    "chat_ids": [],
-    "watchlist": ["bitcoin", "ethereum", "solana"],  # можешь менять
-}
 
 def ensure_state():
     os.makedirs(DATA_DIR, exist_ok=True)
     if not os.path.exists(STATE_FILE):
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_STATE, f, ensure_ascii=False, indent=2)
+            json.dump({"chat_ids": []}, f, ensure_ascii=False, indent=2)
 
-def load_state() -> Dict[str, Any]:
+def load_chat_ids() -> List[int]:
     ensure_state()
     with open(STATE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_state(state: Dict[str, Any]):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+        data = json.load(f)
+    return list({int(x) for x in data.get("chat_ids", [])})
 
 def add_chat_id(chat_id: int):
-    state = load_state()
-    ids = set(int(x) for x in state.get("chat_ids", []))
+    ids = load_chat_ids()
     if chat_id not in ids:
-        ids.add(chat_id)
-        state["chat_ids"] = sorted(ids)
-        save_state(state)
-
-def get_chat_ids() -> List[int]:
-    state = load_state()
-    return [int(x) for x in state.get("chat_ids", [])]
-
-def get_watchlist() -> List[str]:
-    state = load_state()
-    wl = state.get("watchlist", [])
-    return wl if isinstance(wl, list) and wl else ["bitcoin", "ethereum", "solana"]
+        ids.append(chat_id)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"chat_ids": ids}, f, ensure_ascii=False, indent=2)
 
 
 # =========================
@@ -80,113 +63,15 @@ def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 25) ->
     r.raise_for_status()
     return r.json()
 
-
-# =========================
-# CoinGecko helpers
-# =========================
-def cg_price(ids: List[str], vs: str = "usd") -> Dict[str, float]:
-    data = http_get_json(
-        "https://api.coingecko.com/api/v3/simple/price",
-        params={"ids": ",".join(ids), "vs_currencies": vs},
-        timeout=20
-    )
-    out = {}
-    for cid in ids:
-        if cid in data and vs in data[cid]:
-            out[cid] = float(data[cid][vs])
-    return out
-
-def get_btc_dominance_pct() -> Optional[float]:
+def safe_get_json(url: str, params: Optional[dict] = None, timeout: int = 25) -> Optional[Dict[str, Any]]:
     try:
-        data = http_get_json("https://api.coingecko.com/api/v3/global", timeout=20)
-        return float(data["data"]["market_cap_percentage"]["btc"])
+        return http_get_json(url, params=params, timeout=timeout)
     except Exception:
         return None
 
 
 # =========================
-# CryptoPanic news
-# =========================
-def get_top_news(limit: int = 6) -> List[Dict[str, str]]:
-    if not CRYPTOPANIC_API_KEY:
-        return []
-    url = "https://cryptopanic.com/api/v1/posts/"
-    params = {
-        "auth_token": CRYPTOPANIC_API_KEY,
-        "public": "true",
-        "kind": "news",
-        "filter": "rising",
-    }
-    data = http_get_json(url, params=params, timeout=30)
-    out = []
-    for item in data.get("results", [])[:limit]:
-        title = item.get("title") or ""
-        link = item.get("url") or item.get("original_url") or ""
-        if title:
-            out.append({"title": title, "url": link})
-    return out
-
-
-# =========================
-# Liquidations (MVP link + explanation)
-# =========================
-def liquidation_link(symbol: str = "btc") -> str:
-    # Для картинки нужен спец-источник. Сегодня: ссылка + объяснение.
-    return "https://www.coinglass.com/pro/futures/LiquidationHeatMap"
-
-
-# =========================
-# AI Intent + parsing symbols
-# =========================
-INTENT_SYSTEM = """
-Ты крипто-ассистент в Telegram. Пользователь пишет как человек.
-Нужно понять, что он хочет, даже если фраза разговорная.
-
-Верни ТОЛЬКО JSON.
-
-intent:
-- market_overview  (сводка/обзор рынка: "что по рынку", "как рынок", "привет", "что происходит", "дай сводку", "как дела")
-- prices           (цены монет: "сколько btc", "цена эфира", "btc eth sol", "что с соланой")
-- dominance        (доминация BTC)
-- news             (новости/что важного)
-- liquidations     (ликвидации/heatmap/карта ликвидаций)
-- help             (если не понял)
-
-coins:
-- массив тикеров, если пользователь явно просит монеты (например ["BTC","ETH","SOL"])
-- если не указал — пустой массив []
-
-Важное правило:
-Если сообщение похоже на общий вопрос/приветствие, считай это market_overview.
-
-Формат:
-{"intent":"...", "coins":["BTC","ETH"]}
-"""
-
-def detect_intent(user_text: str) -> Dict[str, Any]:
-    r = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": INTENT_SYSTEM},
-            {"role": "user", "content": user_text},
-        ],
-        temperature=0.0,
-    )
-    content = (r.choices[0].message.content or "").strip()
-    try:
-        obj = json.loads(content)
-        intent = obj.get("intent", "help")
-        coins = obj.get("coins", [])
-        if not isinstance(coins, list):
-            coins = []
-        coins = [str(c).upper().strip() for c in coins if str(c).strip()]
-        return {"intent": intent, "coins": coins}
-    except Exception:
-        return {"intent": "help", "coins": []}
-
-
-# =========================
-# Coin mapping (тикер -> coingecko id)
+# Market (CoinGecko)
 # =========================
 COIN_MAP = {
     "BTC": "bitcoin",
@@ -199,112 +84,141 @@ COIN_MAP = {
     "TON": "the-open-network",
     "TRX": "tron",
     "AVAX": "avalanche-2",
-    "MATIC": "polygon-pos",
     "DOT": "polkadot",
     "LTC": "litecoin",
     "LINK": "chainlink",
 }
 
-def normalize_coins(requested: List[str]) -> List[str]:
-    # Если не указал — используем watchlist
-    if not requested:
+def cg_prices(symbols: List[str]) -> Dict[str, float]:
+    ids = [COIN_MAP[s] for s in symbols if s in COIN_MAP]
+    if not ids:
+        ids = ["bitcoin"]
+    data = http_get_json(
+        "https://api.coingecko.com/api/v3/simple/price",
+        params={"ids": ",".join(ids), "vs_currencies": "usd"},
+        timeout=20,
+    )
+    out = {}
+    for sym in symbols:
+        cid = COIN_MAP.get(sym)
+        if cid and cid in data and "usd" in data[cid]:
+            out[sym] = float(data[cid]["usd"])
+    return out
+
+def get_btc_dominance_pct() -> Optional[float]:
+    data = safe_get_json("https://api.coingecko.com/api/v3/global", timeout=20)
+    if not data:
+        return None
+    try:
+        return float(data["data"]["market_cap_percentage"]["btc"])
+    except Exception:
+        return None
+
+def fmt_price(v: float) -> str:
+    return f"${v:,.4f}" if v < 1 else f"${v:,.2f}"
+
+
+# =========================
+# RSS news (без ключей)
+# =========================
+RSS_FEEDS = [
+    # Можно менять/добавлять
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+]
+
+def fetch_rss_news(limit: int = 10) -> List[Dict[str, str]]:
+    items: List[Dict[str, str]] = []
+    for url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(url)
+            for e in feed.entries[:limit]:
+                title = (e.get("title") or "").strip()
+                link = (e.get("link") or "").strip()
+                if title:
+                    items.append({"title": title, "url": link})
+        except Exception:
+            continue
+
+    # убираем дубли по title
+    seen = set()
+    uniq = []
+    for n in items:
+        t = n["title"]
+        if t not in seen:
+            seen.add(t)
+            uniq.append(n)
+    return uniq[:limit]
+
+
+# =========================
+# Liquidations
+# =========================
+def liquidation_link() -> str:
+    return "https://www.coinglass.com/pro/futures/LiquidationHeatMap"
+
+
+# =========================
+# AI intent
+# =========================
+INTENT_SYSTEM = """
+Ты крипто-ассистент в Telegram. Пользователь пишет как человек.
+Определи intent и монеты. Верни только JSON.
+
+intent:
+- market_overview (обзор/сводка/привет/что по рынку/как рынок)
+- prices (цены монет)
+- dominance (доминация BTC)
+- news (новости)
+- liquidations (ликвидации/heatmap)
+- help (если не понял)
+
+coins: массив тикеров (BTC,ETH,SOL...) если пользователь явно упомянул, иначе [].
+Если сообщение выглядит как общий вопрос/привет — market_overview.
+
+Формат: {"intent":"...", "coins":["BTC","ETH"]}
+"""
+
+def detect_intent(text: str) -> Dict[str, Any]:
+    r = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "system", "content": INTENT_SYSTEM},
+                  {"role": "user", "content": text}],
+        temperature=0.0,
+    )
+    content = (r.choices[0].message.content or "").strip()
+    try:
+        obj = json.loads(content)
+        coins = obj.get("coins", [])
+        if not isinstance(coins, list):
+            coins = []
+        coins = [str(c).upper().strip() for c in coins if str(c).strip()]
+        return {"intent": obj.get("intent", "help"), "coins": coins}
+    except Exception:
+        return {"intent": "help", "coins": []}
+
+def normalize_coins(coins: List[str]) -> List[str]:
+    if not coins:
         return ["BTC", "ETH", "SOL"]
-    # Оставляем только те, которые знаем
-    out = []
-    for t in requested:
-        if t in COIN_MAP:
-            out.append(t)
-    # если все неизвестны — fallback к базовым
-    return out if out else ["BTC", "ETH", "SOL"]
-
-def prices_text(coins: List[str]) -> str:
-    ids = [COIN_MAP[c] for c in coins]
-    prices = cg_price(ids, "usd")
-    lines = []
-    for c in coins:
-        cid = COIN_MAP[c]
-        if cid in prices:
-            lines.append(f"{c}: ${prices[cid]:,.4f}" if prices[cid] < 1 else f"{c}: ${prices[cid]:,.2f}")
-        else:
-            lines.append(f"{c}: —")
-    return "\n".join(lines)
+    known = [c for c in coins if c in COIN_MAP]
+    return known if known else ["BTC", "ETH", "SOL"]
 
 
 # =========================
-# AI content generation
+# AI helpers (summary + фильтр важности)
 # =========================
-def ai_market_brief(coins: List[str]) -> str:
-    ids = [COIN_MAP[c] for c in coins]
-    p = cg_price(ids, "usd")
-    dom = get_btc_dominance_pct()
-    news = get_top_news(6)
-    liq = liquidation_link("btc")
-
-    coin_lines = []
-    for c in coins:
-        cid = COIN_MAP[c]
-        val = p.get(cid)
-        if val is None:
-            coin_lines.append(f"{c}: —")
-        else:
-            coin_lines.append(f"{c}: ${val:,.4f}" if val < 1 else f"{c}: ${val:,.2f}")
-
-    news_block = "\n".join([f"- {n['title']}\n  {n.get('url','')}".strip() for n in news]) if news else "— (новости не подключены или нет результата)"
-    dom_line = f"{dom:.2f}%" if dom is not None else "—"
-
-    prompt = f"""
-Сделай короткий, практичный обзор рынка (до 14 строк). Язык: русский.
-Данные:
-Цены:
-{chr(10).join(coin_lines)}
-BTC доминация: {dom_line}
-Новости:
-{news_block}
-Ликвидации (heatmap): {liq}
-
-Формат:
-1) 2-4 строки: что по рынку сейчас
-2) Что важно сегодня (2-4 пункта)
-3) Риски/триггеры (2-4 пункта)
-4) 2-3 строки: как читать heatmap ликвидаций (где кластеры, что значит магнит)
-"""
-    r = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.4,
-    )
-    return (r.choices[0].message.content or "").strip()
-
-def ai_liquidations_explain(symbol: str) -> str:
-    liq = liquidation_link(symbol)
-    prompt = f"""
-Поясни ликвидации/heatmap для {symbol}.
-Коротко и понятно (8-12 строк):
-- что такое кластеры ликвидаций
-- как использовать уровни
-- что значит "вынос"
-- риск-заметка
-В конце ссылка: {liq}
-"""
-    r = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.4,
-    )
-    return (r.choices[0].message.content or "").strip()
-
 def ai_news_digest(news: List[Dict[str, str]]) -> str:
     if not news:
-        return "Новости не подключены или нет результата."
-    news_block = "\n".join([f"- {n['title']}\n  {n.get('url','')}".strip() for n in news])
+        return "Новостей сейчас не нашёл (RSS временно недоступен)."
+    block = "\n".join([f"- {n['title']}\n  {n.get('url','')}".strip() for n in news[:6]])
     prompt = f"""
 Вот новости:
-{news_block}
+{block}
 
-Сделай вывод:
-- какие 1-2 новости high impact для крипты и почему
-- что мониторить сегодня (1-2 пункта)
-Коротко.
+Сделай коротко:
+- какие 1-2 новости high-impact для крипты и почему
+- что мониторить сегодня
 """
     r = client.chat.completions.create(
         model="gpt-4.1-mini",
@@ -327,115 +241,127 @@ def ai_is_high_impact_news(title: str) -> bool:
     ans = (r.choices[0].message.content or "").strip().upper()
     return ans.startswith("YES")
 
+def ai_market_brief(coins: List[str]) -> str:
+    prices = cg_prices(coins)
+    dom = get_btc_dominance_pct()
+    news = fetch_rss_news(8)
+    liq = liquidation_link()
+
+    price_lines = "\n".join([f"{c}: {fmt_price(prices[c])}" for c in coins if c in prices])
+    dom_line = f"{dom:.2f}%" if dom is not None else "—"
+    news_block = "\n".join([f"- {n['title']}" for n in news[:6]]) if news else "— (RSS недоступен)"
+
+    prompt = f"""
+Сделай короткий, практичный обзор рынка (до 14 строк), русский.
+Данные:
+Цены:
+{price_lines}
+BTC доминация: {dom_line}
+Новости (RSS):
+{news_block}
+Ликвидации: {liq}
+
+Формат:
+1) 2-4 строки что по рынку
+2) Что важно сегодня (2-4 пункта)
+3) Риски/триггеры (2-4 пункта)
+4) 2 строки как читать heatmap ликвидаций
+"""
+    r = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.4,
+    )
+    return (r.choices[0].message.content or "").strip()
+
+def ai_liq_explain() -> str:
+    liq = liquidation_link()
+    prompt = f"""
+Объясни простыми словами, что такое heatmap ликвидаций и как её читать (8-12 строк).
+В конце дай ссылку: {liq}
+"""
+    r = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.4,
+    )
+    return (r.choices[0].message.content or "").strip()
+
 
 # =========================
 # Telegram handlers
 # =========================
-HELP_TEXT = (
-    "Пиши как угодно, я пойму 🙂\n\n"
+HELP = (
+    "Пиши как угодно 🙂\n"
     "Примеры:\n"
-    "• «привет, что по рынку?»\n"
-    "• «как там рынок?»\n"
-    "• «цена btc и eth»\n"
-    "• «доминация биткоина»\n"
-    "• «новости»\n"
-    "• «карта ликвидаций btc»\n"
+    "• привет, что по рынку?\n"
+    "• цены btc eth sol\n"
+    "• доминация\n"
+    "• новости\n"
+    "• ликвидации\n"
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_chat_id(update.effective_chat.id)
-    await update.message.reply_text("Я запущен ✅\n\n" + HELP_TEXT)
+    await update.message.reply_text("Я запущен ✅\n\n" + HELP)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text(HELP)
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_chat_id(update.effective_chat.id)
-    user_text = (update.message.text or "").strip()
+    text = (update.message.text or "").strip()
 
-    intent = detect_intent(user_text)
-    kind = intent["intent"]
+    intent = detect_intent(text)
+    kind = intent.get("intent", "help")
     coins = normalize_coins(intent.get("coins", []))
 
-    try:
-        if kind == "market_overview":
-            brief = ai_market_brief(coins)
-            # добавим компактные цифры наверху
-            dom = get_btc_dominance_pct()
-            header = "📊 Сводка рынка\n\n" + prices_text(coins)
-            header += f"\n\nBTC доминация: {dom:.2f}%\n\n" if dom is not None else "\n\nBTC доминация: —\n\n"
-            await update.message.reply_text(header + brief)
-            return
+    if kind == "prices":
+        p = cg_prices(coins)
+        lines = [f"{c}: {fmt_price(p[c])}" for c in coins if c in p]
+        await update.message.reply_text("💰 Цены:\n" + ("\n".join(lines) if lines else "Не удалось получить цены сейчас."))
+        return
 
-        if kind == "prices":
-            await update.message.reply_text("💰 Цены:\n" + prices_text(coins))
-            return
-
-        if kind == "dominance":
-            dom = get_btc_dominance_pct()
-            await update.message.reply_text(f"BTC доминация: {dom:.2f}%" if dom is not None else "Не удалось получить доминацию сейчас.")
-            return
-
-        if kind == "news":
-            news = get_top_news(6)
-            if not news:
-                await update.message.reply_text("Новости не подключены или нет результата (проверь CRYPTOPANIC_API_KEY).")
-                return
-            txt = "📰 Топ новости:\n\n" + "\n\n".join([f"- {n['title']}\n{n.get('url','')}".strip() for n in news])
-            digest = ai_news_digest(news)
-            await update.message.reply_text(txt + "\n\n" + digest)
-            return
-
-        if kind == "liquidations":
-            # для простоты берём первую монету из списка
-            sym = coins[0] if coins else "BTC"
-            msg = ai_liquidations_explain(sym)
-            await update.message.reply_text(msg)
-            return
-
-        # help / fallback: отвечаем умно на любой текст
-        # + добавим небольшой market context
-        ids = [COIN_MAP[c] for c in coins]
-        p = cg_price(ids, "usd")
+    if kind == "dominance":
         dom = get_btc_dominance_pct()
-        news = get_top_news(4)
-        news_titles = "\n".join([f"- {n['title']}" for n in news]) if news else "—"
-        dom_line = f"{dom:.2f}%" if dom is not None else "—"
+        await update.message.reply_text(f"BTC доминация: {dom:.2f}%" if dom is not None else "Не удалось получить доминацию сейчас.")
+        return
 
-        ctx_prices = []
-        for c in coins:
-            val = p.get(COIN_MAP[c])
-            ctx_prices.append(f"{c}={val}" if val is not None else f"{c}=—")
+    if kind == "news":
+        news = fetch_rss_news(8)
+        if not news:
+            await update.message.reply_text("RSS новости сейчас недоступны. Попробуй позже.")
+            return
+        digest = ai_news_digest(news)
+        txt = "📰 RSS Новости:\n\n" + "\n\n".join([f"- {n['title']}\n{n.get('url','')}".strip() for n in news[:6]])
+        await update.message.reply_text(txt + "\n\n" + digest)
+        return
 
-        prompt = f"""
-Пользователь: {user_text}
+    if kind == "liquidations":
+        await update.message.reply_text(ai_liq_explain())
+        return
 
-Контекст рынка:
-Цены: {", ".join(ctx_prices)}
-BTC доминация: {dom_line}
-Новости: {news_titles}
+    if kind == "market_overview":
+        brief = ai_market_brief(coins)
+        dom = get_btc_dominance_pct()
+        p = cg_prices(coins)
+        header_lines = [f"{c}: {fmt_price(p[c])}" for c in coins if c in p]
+        header = "📊 Сводка рынка\n" + ("\n".join(header_lines) if header_lines else "")
+        header += f"\nBTC доминация: {dom:.2f}%\n\n" if dom is not None else "\nBTC доминация: —\n\n"
+        await update.message.reply_text(header + brief)
+        return
 
-Ответь как умный крипто-помощник: сначала ответь на пользователя, затем 2-4 строки что по рынку.
-"""
-        r = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.4,
-        )
-        await update.message.reply_text((r.choices[0].message.content or "").strip())
-
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {type(e).__name__}: {e}")
+    await update.message.reply_text("Не до конца понял. " + HELP)
 
 
 # =========================
-# AUTO ALERTS (volatility + high-impact news)
+# Alerts (волатильность + важные RSS новости)
 # =========================
 _last_prices: Optional[Dict[str, float]] = None
 _last_news_titles: set[str] = set()
 _last_alert_ts: float = 0.0
 
-def _rate_limit(seconds: int) -> bool:
+def rate_limit(seconds: int) -> bool:
     global _last_alert_ts
     now = time.time()
     if now - _last_alert_ts < seconds:
@@ -444,63 +370,52 @@ def _rate_limit(seconds: int) -> bool:
     return False
 
 def alert_job(app: Application):
-    """
-    Every 5 minutes:
-    - volatility alert for BTC/ETH/SOL (watchlist)
-    - high impact news alert (filtered by AI)
-    """
     global _last_prices, _last_news_titles
 
-    chat_ids = get_chat_ids()
+    chat_ids = load_chat_ids()
     if not chat_ids:
         return
 
-    coins = ["BTC", "ETH", "SOL"]  # базовый набор для алертов
-    ids = [COIN_MAP[c] for c in coins]
-
-    # 1) Volatility alerts
+    # Volatility: BTC/ETH/SOL
+    coins = ["BTC", "ETH", "SOL"]
     try:
-        current = cg_price(ids, "usd")
-        # current: {"bitcoin": price, ...}
+        current = cg_prices(coins)  # {BTC:..., ETH:...}
         if _last_prices is not None:
             for c in coins:
-                cid = COIN_MAP[c]
-                if cid in current and cid in _last_prices and _last_prices[cid] > 0:
-                    change = abs(current[cid] - _last_prices[cid]) / _last_prices[cid] * 100.0
-                    if change >= 2.0 and not _rate_limit(180):  # антиспам общий
-                        msg = f"🚨 Волатильность {c}\nИзменение: {change:.2f}%\nЦена: ${current[cid]:,.2f}"
-                        for chat_id in chat_ids:
-                            app.bot.send_message(chat_id, msg)
+                if c in current and c in _last_prices and _last_prices[c] > 0:
+                    change = abs(current[c] - _last_prices[c]) / _last_prices[c] * 100
+                    if change >= 2.0 and not rate_limit(180):
+                        msg = f"🚨 Волатильность {c}\nИзменение: {change:.2f}%\nЦена: {fmt_price(current[c])}"
+                        for cid in chat_ids:
+                            app.bot.send_message(cid, msg)
         _last_prices = current
     except Exception:
         pass
 
-    # 2) High-impact news alerts
-    if CRYPTOPANIC_API_KEY:
-        try:
-            news = get_top_news(6)
-            fresh = [n for n in news if n.get("title") and n["title"] not in _last_news_titles]
-            if fresh and not _rate_limit(180):
-                # фильтруем через AI
-                sent = 0
-                for n in fresh:
-                    title = n["title"]
-                    if ai_is_high_impact_news(title):
-                        msg = "📰 High-impact новость:\n\n" + title
-                        if n.get("url"):
-                            msg += "\n" + n["url"]
-                        for chat_id in chat_ids:
-                            app.bot.send_message(chat_id, msg)
-                        sent += 1
-                        if sent >= 2:
-                            break
-            _last_news_titles = {n["title"] for n in news if n.get("title")}
-        except Exception:
-            pass
+    # High-impact RSS news
+    try:
+        news = fetch_rss_news(10)
+        fresh = [n for n in news if n.get("title") and n["title"] not in _last_news_titles]
+        if fresh and not rate_limit(180):
+            sent = 0
+            for n in fresh:
+                title = n["title"]
+                if ai_is_high_impact_news(title):
+                    msg = "📰 High-impact новость (RSS):\n\n" + title
+                    if n.get("url"):
+                        msg += "\n" + n["url"]
+                    for cid in chat_ids:
+                        app.bot.send_message(cid, msg)
+                    sent += 1
+                    if sent >= 2:
+                        break
+        _last_news_titles = {n["title"] for n in news if n.get("title")}
+    except Exception:
+        pass
 
 
 # =========================
-# MAIN
+# Main
 # =========================
 def main():
     ensure_state()
