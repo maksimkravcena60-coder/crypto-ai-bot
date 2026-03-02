@@ -1,5 +1,6 @@
 python-telegram-bot==20.7
 openai>=1.0.0
-requests
-python-dotenv
-APScheduler
+requests==2.32.3
+python-dotenv==1.0.1
+APScheduler==3.10.4
+feedparser==6.0.11
